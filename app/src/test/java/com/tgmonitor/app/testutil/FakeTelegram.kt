@@ -21,7 +21,7 @@ class FakeTelegram(private val username: String) : PageFetcher {
         posts[id] = Post(text, links, hasText)
     }
 
-    fun addRange(range: LongRange) = range.forEach { add(it) }
+    fun addRange(range: IntRange) = range.forEach { add(it.toLong()) }
 
     fun editText(id: Long, text: String) { posts.getValue(id).text = text }
     fun editLinks(id: Long, links: List<String>) { posts.getValue(id).links = links }
