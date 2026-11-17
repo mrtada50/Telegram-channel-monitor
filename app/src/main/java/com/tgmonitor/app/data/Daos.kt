@@ -7,6 +7,28 @@ import androidx.room.Query
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
+/** Lightweight row for lists: only a 160-char preview, never the full text. */
+data class MessageListItem(
+    val id: Long,
+    val channelId: Long,
+    val messageId: Long,
+    val preview: String,
+    val publishedAt: Long?,
+    val firstSeenAt: Long,
+    val deletionStatus: String,
+    val versionCount: Int,
+)
+
+data class ChangeListItem(
+    val id: Long,
+    val channelId: Long,
+    val messageId: Long,
+    val changeType: String,
+    val detail: String?,
+    val preview: String?,
+    val detectedAt: Long,
+)
+
 @Dao
 interface ChannelDao {
     @Insert(onConflict = OnConflictStrategy.ABORT)
@@ -75,8 +97,11 @@ interface MessageDao {
     @Query("UPDATE messages SET lastCheckedAt = :time WHERE channelId = :channelId AND messageId IN (:ids)")
     suspend fun touch(channelId: Long, ids: List<Long>, time: Long)
 
-    @Query("SELECT * FROM messages WHERE channelId = :channelId ORDER BY messageId DESC LIMIT 500")
-    fun observeForChannel(channelId: Long): Flow<List<MessageEntity>>
+    @Query(
+        "SELECT id, channelId, messageId, substr(currentText, 1, 160) AS preview, publishedAt, firstSeenAt, " +
+            "deletionStatus, versionCount FROM messages WHERE channelId = :channelId ORDER BY messageId DESC LIMIT 200"
+    )
+    fun observeForChannel(channelId: Long): Flow<List<MessageListItem>>
 
     @Query("SELECT * FROM messages WHERE channelId = :channelId AND messageId = :messageId LIMIT 1")
     fun observeOne(channelId: Long, messageId: Long): Flow<MessageEntity?>
@@ -112,14 +137,27 @@ interface ChangeDao {
     suspend fun insert(event: ChangeEventEntity): Long
 
     @Query(
-        "SELECT * FROM change_events WHERE (:channelId IS NULL OR channelId = :channelId) " +
+        "SELECT id, channelId, messageId, changeType, detail, " +
+            "substr(COALESCE(newContent, oldContent, ''), 1, 160) AS preview, detectedAt " +
+            "FROM change_events WHERE (:channelId IS NULL OR channelId = :channelId) " +
             "AND (:filterTypes = 0 OR changeType IN (:types)) AND detectedAt >= :since " +
-            "ORDER BY detectedAt DESC, id DESC LIMIT 500"
+            "ORDER BY detectedAt DESC, id DESC LIMIT 300"
     )
-    fun observeFiltered(channelId: Long?, filterTypes: Boolean, types: List<String>, since: Long): Flow<List<ChangeEventEntity>>
+    fun observeFiltered(channelId: Long?, filterTypes: Boolean, types: List<String>, since: Long): Flow<List<ChangeListItem>>
 
-    @Query("SELECT * FROM change_events WHERE channelId = :channelId ORDER BY detectedAt DESC, id DESC LIMIT 300")
-    fun observeForChannel(channelId: Long): Flow<List<ChangeEventEntity>>
+    @Query(
+        "SELECT id, channelId, messageId, changeType, detail, " +
+            "substr(COALESCE(newContent, oldContent, ''), 1, 160) AS preview, detectedAt " +
+            "FROM change_events WHERE channelId = :channelId ORDER BY detectedAt DESC, id DESC LIMIT 200"
+    )
+    fun observeForChannel(channelId: Long): Flow<List<ChangeListItem>>
+
+    @Query(
+        "SELECT id, channelId, messageId, changeType, detail, " +
+            "substr(COALESCE(newContent, oldContent, ''), 1, 160) AS preview, detectedAt " +
+            "FROM change_events ORDER BY detectedAt DESC, id DESC LIMIT :limit"
+    )
+    fun observeRecent(limit: Int): Flow<List<ChangeListItem>>
 
     @Query("SELECT COUNT(*) FROM change_events WHERE changeType IN (:types) AND detectedAt >= :since")
     fun observeCountSince(types: List<String>, since: Long): Flow<Int>

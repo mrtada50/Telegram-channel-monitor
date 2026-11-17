@@ -23,6 +23,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - uses: android-actions/setup-android@v3
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -53,6 +54,17 @@ jobs:
           name: telegram-channel-monitor-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # Optimized build: much smoother than debug. Allowed to fail without breaking the debug build.
+      - name: Assemble release APK (R8, debug-signed)
+        continue-on-error: true
+        run: ./gradlew assembleRelease --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-channel-monitor-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
 
       # Optional: push a tag like v0.1.0 to publish the debug APK as a GitHub Release.
       - name: Create release (tags only)

@@ -5,14 +5,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgmonitor.app.AppContainer
 import com.tgmonitor.app.data.AppSettings
-import com.tgmonitor.app.data.ChangeEventEntity
+import com.tgmonitor.app.data.ChangeListItem
 import com.tgmonitor.app.data.ChangeType
 import com.tgmonitor.app.data.ChannelEntity
 import com.tgmonitor.app.data.ExportFormat
 import com.tgmonitor.app.data.MessageEntity
+import com.tgmonitor.app.data.MessageListItem
 import com.tgmonitor.app.data.MessageVersionEntity
 import com.tgmonitor.app.engine.AddChannelResult
 import com.tgmonitor.app.engine.NotificationKind
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -20,6 +22,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -33,6 +36,8 @@ data class HomeState(
     val lastScan: Long? = null,
     val settings: AppSettings = AppSettings(),
     val previewDisabled: Int = 0,
+    val recent: List<ChangeListItem> = emptyList(),
+    val names: Map<Long, String> = emptyMap(),
 )
 
 class HomeViewModel(private val c: AppContainer) : ViewModel() {
@@ -46,9 +51,14 @@ class HomeViewModel(private val c: AppContainer) : ViewModel() {
     ) { ch, ms, ed, de, last -> HomeState(ch, ms, ed, de, last) }
 
     val state: StateFlow<HomeState> = combine(
-        counts, c.settings.settings, c.db.channelDao().observePreviewDisabledCount(),
-    ) { s, set, pd -> s.copy(settings = set, previewDisabled = pd) }
-        .stateIn(viewModelScope, WHILE_SUBSCRIBED, HomeState())
+        counts,
+        c.settings.settings,
+        c.db.channelDao().observePreviewDisabledCount(),
+        c.db.changeDao().observeRecent(5),
+        c.db.channelDao().observeAll(),
+    ) { s, set, pd, recent, chans ->
+        s.copy(settings = set, previewDisabled = pd, recent = recent, names = chans.associate { it.id to it.title })
+    }.stateIn(viewModelScope, WHILE_SUBSCRIBED, HomeState())
 
     val scanning: StateFlow<Boolean> = c.scheduler.manualScanRunning().stateIn(viewModelScope, WHILE_SUBSCRIBED, false)
 
@@ -91,9 +101,9 @@ class ChannelsViewModel(private val c: AppContainer) : ViewModel() {
 
 class ChannelDetailsViewModel(c: AppContainer, private val channelId: Long) : ViewModel() {
     val channel: StateFlow<ChannelEntity?> = c.db.channelDao().observeById(channelId).stateIn(viewModelScope, WHILE_SUBSCRIBED, null)
-    val messages: StateFlow<List<MessageEntity>> =
+    val messages: StateFlow<List<MessageListItem>> =
         c.db.messageDao().observeForChannel(channelId).stateIn(viewModelScope, WHILE_SUBSCRIBED, emptyList())
-    val events: StateFlow<List<ChangeEventEntity>> =
+    val events: StateFlow<List<ChangeListItem>> =
         c.db.changeDao().observeForChannel(channelId).stateIn(viewModelScope, WHILE_SUBSCRIBED, emptyList())
     private val scheduler = c.scheduler
     fun scan() = scheduler.scanNow(channelId, manual = true)
@@ -124,7 +134,7 @@ class ChangesViewModel(c: AppContainer) : ViewModel() {
     val filter = MutableStateFlow(ChangeFilter())
     val channels: StateFlow<List<ChannelEntity>> =
         c.db.channelDao().observeAll().stateIn(viewModelScope, WHILE_SUBSCRIBED, emptyList())
-    val events: StateFlow<List<ChangeEventEntity>> = filter.flatMapLatest { f ->
+    val events: StateFlow<List<ChangeListItem>> = filter.flatMapLatest { f ->
         c.db.changeDao().observeFiltered(
             f.channelId, f.type != TypeFilter.ALL,
             if (f.type.types.isEmpty()) listOf("") else f.type.types, f.range.since(),
@@ -150,6 +160,7 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
     val stats: StateFlow<StorageStats> = combine(
         c.db.channelDao().observeCount(), c.db.messageDao().observeCount(), c.db.versionDao().observeCount(),
     ) { ch, ms, v -> StorageStats(ch, ms, v, c.dbFileSize()) }
+        .flowOn(Dispatchers.IO) // file stat off the main thread
         .stateIn(viewModelScope, WHILE_SUBSCRIBED, StorageStats())
     val exportMessage = MutableStateFlow<String?>(null)
 
