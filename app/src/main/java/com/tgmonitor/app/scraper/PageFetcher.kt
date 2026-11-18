@@ -31,6 +31,7 @@ class OkHttpPageFetcher(
                 .url(url)
                 .header("User-Agent", USER_AGENT)
                 .header("Accept-Language", "en")
+                .header("Cache-Control", "no-cache")
                 .build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {

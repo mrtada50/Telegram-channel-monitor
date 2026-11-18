@@ -12,29 +12,40 @@ import com.tgmonitor.app.data.MonitorStore
 import com.tgmonitor.app.data.NewItem
 import com.tgmonitor.app.data.ScanCommit
 import com.tgmonitor.app.data.VerificationStatus
-import com.tgmonitor.app.scraper.EmbedState
-import com.tgmonitor.app.scraper.FetchResult
 import com.tgmonitor.app.scraper.PageFetcher
-import com.tgmonitor.app.scraper.PageParse
 import com.tgmonitor.app.scraper.ParsedMessage
-import com.tgmonitor.app.scraper.TelegramPageParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlin.random.Random
 
 /**
  * Scans one channel: finds every new post since the last committed checkpoint (with pagination),
  * detects edits, and verifies deletions. The checkpoint only advances inside the same transaction
  * that stores the posts, so an unsaved post is never skipped.
+ *
+ * False-positive protection: an edit or a deletion is only believed after a SECOND independent
+ * fetch agrees with the first (stale CDN pages, truncated pages and parsing noise do not repeat).
  */
 class ScanEngine(
     private val store: MonitorStore,
-    private val fetcher: PageFetcher,
+    fetcher: PageFetcher,
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val maxPages: Int = 100,
     private val batchSize: Int = 100,
     private val maxVerifications: Int = 10,
     private val pageDelayMs: Long = 0L,
+    private val confirmDelayMs: Long = 0L,
+    /** Logged-in Telegram account source (optional). Used only for channels where [useAccount] says so. */
+    private val accountSource: MessageSource? = null,
+    private val useAccount: suspend (ChannelEntity) -> Boolean = { false },
 ) {
+    private val htmlSource: MessageSource = HtmlMessageSource(fetcher)
+
+    private suspend fun sourceFor(ch: ChannelEntity): MessageSource {
+        val account = accountSource
+        return if (account != null && useAccount(ch)) account else htmlSource
+    }
+
     private class Accumulator {
         var posts = 0
         var newPosts = 0
@@ -46,17 +57,19 @@ class ScanEngine(
 
     private class Failure(val channelStatus: String?, val message: String, val rateLimited: Boolean = false)
 
-    private sealed interface PageOutcome {
-        class Ok(val title: String?, val messages: List<ParsedMessage>) : PageOutcome
-        class Failed(val failure: Failure) : PageOutcome
+    private class Collected(val title: String?, val all: List<ParsedMessage>, val pages: Int)
+
+    private sealed interface CollectOutcome {
+        class Ok(val collected: Collected) : CollectOutcome
+        class Failed(val failure: Failure) : CollectOutcome
     }
+
+    private class Candidates(val existing: List<MessageEntity>, val edits: Map<Long, String>, val missing: Set<Long>)
 
     private sealed interface PassResult {
         class Done(val needsRecheck: Boolean) : PassResult
         class Failed(val failure: Failure) : PassResult
     }
-
-    private enum class Verify { EXISTS, GONE, INCONCLUSIVE, ERROR }
 
     suspend fun scanChannel(channelId: Long): ScanOutcome {
         store.getChannel(channelId) ?: return ScanOutcome(status = "FAILED", error = "القناة غير موجودة")
@@ -128,26 +141,23 @@ class ScanEngine(
         )
     }
 
-    private suspend fun runPass(channelId: Long, acc: Accumulator): PassResult {
-        val ch = store.getChannel(channelId) ?: return PassResult.Failed(Failure(null, "القناة حُذفت أثناء الفحص"))
-        val isBaseline = !ch.baselineSet
+    /** Fetches the newest page and walks backwards until it reaches already-checkpointed territory. */
+    private suspend fun collect(ch: ChannelEntity, src: MessageSource): CollectOutcome {
         val canPaginate = ch.baselineSet && ch.lastKnownMessageId > 0
-
-        val first = when (val p = fetchPage(ch, null, false)) {
-            is PageOutcome.Failed -> return PassResult.Failed(p.failure)
-            is PageOutcome.Ok -> p
+        val first = when (val p = src.page(ch, null, false)) {
+            is SourcePage.Failed -> return CollectOutcome.Failed(p.toFailure())
+            is SourcePage.Ok -> p
         }
         val collected = HashMap<Long, ParsedMessage>()
         first.messages.forEach { collected[it.id] = it }
         var pages = 1
         var cursor: Long? = collected.keys.minOrNull()
-        // Walk backwards until we reach already-checkpointed territory (never stop at "latest post only").
         while (canPaginate && cursor != null && cursor > ch.lastKnownMessageId && pages < maxPages) {
             val before: Long = cursor
-            if (pageDelayMs > 0) delay(pageDelayMs)
-            val p = when (val r = fetchPage(ch, before, true)) {
-                is PageOutcome.Failed -> return PassResult.Failed(r.failure) // abort: a gap must not be committed
-                is PageOutcome.Ok -> r
+            if (pageDelayMs > 0) delay(jitter(pageDelayMs))
+            val p = when (val r = src.page(ch, before, true)) {
+                is SourcePage.Failed -> return CollectOutcome.Failed(r.toFailure()) // abort: a gap must not be committed
+                is SourcePage.Ok -> r
             }
             val older = p.messages.filter { it.id < before }
             if (older.isEmpty()) break
@@ -155,15 +165,70 @@ class ScanEngine(
             pages++
             cursor = older.minOf { it.id }
         }
+        return CollectOutcome.Ok(
+            Collected(first.title?.takeIf { it.isNotBlank() }, collected.values.sortedBy { it.id }, pages)
+        )
+    }
 
-        val all = collected.values.sortedBy { it.id }
+    private suspend fun findCandidates(ch: ChannelEntity, all: List<ParsedMessage>): Candidates {
+        if (all.isEmpty()) return Candidates(emptyList(), emptyMap(), emptySet())
+        val existing = store.getMessagesFrom(ch.id, all.first().id)
+        val byId = existing.associateBy { it.messageId }
+        val edits = HashMap<Long, String>()
+        for (pm in all) {
+            val ex = byId[pm.id] ?: continue
+            val h = ContentHasher.hash(pm.text, pm.links)
+            if (h != ex.contentHash) edits[pm.id] = h
+        }
+        val present = all.mapTo(HashSet()) { it.id }
+        val newest = all.last().id
+        // Only posts OLDER than the newest visible post can be judged missing: a stale or partial
+        // page lacks the newest posts, never the older ones.
+        val missing = existing
+            .filter { it.messageId !in present && it.messageId < newest && it.deletionStatus != DeletionStatus.CONFIRMED_DELETED }
+            .map { it.messageId }
+            .toSet()
+        return Candidates(existing, edits, missing)
+    }
+
+    private suspend fun runPass(channelId: Long, acc: Accumulator): PassResult {
+        val ch = store.getChannel(channelId) ?: return PassResult.Failed(Failure(null, "القناة حُذفت أثناء الفحص"))
+        val isBaseline = !ch.baselineSet
+        val src = sourceFor(ch)
+
+        var data = when (val r = collect(ch, src)) {
+            is CollectOutcome.Failed -> return PassResult.Failed(r.failure)
+            is CollectOutcome.Ok -> r.collected
+        }
+        var cand = findCandidates(ch, data.all)
+        var confirmedEdits: Set<Long> = cand.edits.keys
+        var confirmedMissing: Set<Long> = cand.missing
+
+        if (!isBaseline && (cand.edits.isNotEmpty() || cand.missing.isNotEmpty())) {
+            // Second, independent look before believing an edit or a deletion.
+            if (confirmDelayMs > 0) delay(jitter(confirmDelayMs))
+            when (val r2 = collect(ch, src)) {
+                is CollectOutcome.Failed -> {
+                    confirmedEdits = emptySet()
+                    confirmedMissing = emptySet()
+                }
+                is CollectOutcome.Ok -> {
+                    val cand2 = findCandidates(ch, r2.collected.all)
+                    confirmedEdits = cand.edits.filter { (id, hash) -> cand2.edits[id] == hash }.keys
+                    confirmedMissing = cand.missing.intersect(cand2.missing)
+                    data = r2.collected
+                    cand = cand2
+                }
+            }
+        }
+
+        val all = data.all
         acc.posts += all.size
         val now = clock()
-        val title = first.title?.takeIf { it.isNotBlank() }
+        val title = data.title
         val channelTitle = title ?: ch.title
         val maxId = all.lastOrNull()?.id ?: 0L
-        val minId = all.firstOrNull()?.id ?: 0L
-        val existing = if (all.isEmpty()) emptyList() else store.getMessagesFrom(ch.id, minId)
+        val existing = cand.existing
         val existingById = existing.associateBy { it.messageId }
 
         val newItems = mutableListOf<NewItem>()
@@ -179,18 +244,21 @@ class ScanEngine(
             val ex = existingById[pm.id]
             if (ex == null) {
                 if (!pm.hasContent) continue
-                val event = if (isBaseline) null else ChangeEventEntity(
+                // A post whose id is at or below the checkpoint cannot be new: it is an older post the
+                // baseline window did not cover. Store it silently (no event, no notification).
+                val silent = isBaseline || pm.id <= ch.lastKnownMessageId
+                val event = if (silent) null else ChangeEventEntity(
                     channelId = ch.id, messageId = pm.id, changeType = ChangeType.NEW_POST,
                     newContent = ContentFormat.display(pm.text, pm.links), detectedAt = now,
                     verificationStatus = VerificationStatus.NOT_APPLICABLE,
                 )
                 newItems += NewItem(newMessage(ch.id, pm, now), event)
-                if (!isBaseline) notes += ScanNotification(NotificationKind.NEW_POST, ch.id, channelTitle, pm.id, now, null)
+                if (!silent) notes += ScanNotification(NotificationKind.NEW_POST, ch.id, channelTitle, pm.id, now, null)
                 continue
             }
             var updated = ex
             val newHash = ContentHasher.hash(pm.text, pm.links)
-            if (newHash != ex.contentHash) {
+            if (newHash != ex.contentHash && pm.id in confirmedEdits) {
                 val oldLinks = LinkCodec.decode(ex.currentLinks)
                 val cls = EditClassifier.classify(ex.currentText, oldLinks, pm.text, pm.links)
                 val version = ex.versionCount + 1
@@ -221,21 +289,20 @@ class ScanEngine(
             if (updated != ex) updates += updated
         }
 
-        // Deletion detection only runs on a healthy page that actually listed posts.
-        if (all.isNotEmpty()) {
-            val present = all.mapTo(HashSet()) { it.id }
+        // Deletion detection: only posts missing in BOTH independent fetches are examined.
+        if (all.isNotEmpty() && confirmedMissing.isNotEmpty()) {
             var budget = maxVerifications
             for (m in existing) {
-                if (m.messageId in present || m.deletionStatus == DeletionStatus.CONFIRMED_DELETED) continue
-                val verdict = if (budget > 0) { budget--; verifyDeletion(ch.username, m.messageId) } else Verify.ERROR
+                if (m.messageId !in confirmedMissing) continue
+                val verdict = if (budget > 0) { budget--; src.check(ch, m.messageId) } else DeletionCheck.ERROR
                 val missing = m.missingScans + 1
                 when (verdict) {
-                    Verify.EXISTS -> {
+                    DeletionCheck.EXISTS -> {
                         if (m.deletionStatus != DeletionStatus.ACTIVE || m.missingScans != 0) {
                             updates += m.copy(deletionStatus = DeletionStatus.ACTIVE, missingScans = 0, deletionDetectedAt = null)
                         }
                     }
-                    Verify.GONE -> {
+                    DeletionCheck.GONE -> {
                         updates += m.copy(
                             deletionStatus = DeletionStatus.CONFIRMED_DELETED, missingScans = missing,
                             deletionDetectedAt = m.deletionDetectedAt ?: now, lastCheckedAt = now,
@@ -244,7 +311,7 @@ class ScanEngine(
                         notes += ScanNotification(NotificationKind.DELETION_CONFIRMED, ch.id, channelTitle, m.messageId, now, null)
                         confirmed++
                     }
-                    Verify.INCONCLUSIVE, Verify.ERROR -> {
+                    DeletionCheck.INCONCLUSIVE, DeletionCheck.ERROR -> {
                         val status = if (missing >= SUSPECT_AFTER_SCANS) DeletionStatus.SUSPECTED_DELETED else DeletionStatus.UNKNOWN
                         updates += m.copy(deletionStatus = status, missingScans = missing, deletionDetectedAt = m.deletionDetectedAt ?: now)
                         if (status == DeletionStatus.SUSPECTED_DELETED && m.deletionStatus != DeletionStatus.SUSPECTED_DELETED) {
@@ -295,8 +362,10 @@ class ScanEngine(
         acc.suspected += suspected
         acc.confirmed += confirmed
         acc.notifications += notes
-        return PassResult.Done(needsRecheck = newCount > 0 || pages > 1)
+        return PassResult.Done(needsRecheck = newCount > 0 || data.pages > 1)
     }
+
+    private fun jitter(baseMs: Long): Long = (baseMs * (0.6 + Random.nextDouble() * 0.9)).toLong()
 
     private fun newMessage(channelId: Long, pm: ParsedMessage, now: Long) = MessageEntity(
         channelId = channelId, messageId = pm.id,
@@ -313,50 +382,11 @@ class ScanEngine(
             detectedAt = now, verificationStatus = verification,
         )
 
-    private suspend fun verifyDeletion(username: String, messageId: Long): Verify =
-        when (val r = fetcher.fetch("https://t.me/$username/$messageId?embed=1&mode=tme")) {
-            is FetchResult.Ok -> when (TelegramPageParser.classifyEmbed(r.html)) {
-                EmbedState.EXISTS -> Verify.EXISTS
-                EmbedState.GONE -> Verify.GONE
-                EmbedState.INCONCLUSIVE -> Verify.INCONCLUSIVE
-            }
-            else -> Verify.ERROR
-        }
-
-    private suspend fun fetchPage(ch: ChannelEntity, before: Long?, pagination: Boolean): PageOutcome {
-        val url = if (before == null) "https://t.me/s/${ch.username}" else "https://t.me/s/${ch.username}?before=$before"
-        return when (val r = fetcher.fetch(url)) {
-            is FetchResult.NetworkError ->
-                PageOutcome.Failed(Failure(ChannelStatus.NETWORK_ERROR, "خطأ شبكة: ${r.message}"))
-            is FetchResult.HttpError -> PageOutcome.Failed(
-                when {
-                    r.code == 404 -> Failure(ChannelStatus.NOT_FOUND, "HTTP 404")
-                    r.code == 403 -> Failure(ChannelStatus.ACCESS_DENIED, "HTTP 403")
-                    r.code == 429 -> Failure(ChannelStatus.RATE_LIMITED, "HTTP 429 (تقييد من الخادم)", rateLimited = true)
-                    r.code >= 500 -> Failure(ChannelStatus.SERVER_ERROR, "HTTP ${r.code}")
-                    else -> Failure(ChannelStatus.NETWORK_ERROR, "HTTP ${r.code}")
-                }
-            )
-            is FetchResult.Ok -> when (val p = TelegramPageParser.parseChannelPage(r.html, r.finalUrl, ch.username)) {
-                is PageParse.Messages -> PageOutcome.Ok(p.title, p.messages)
-                is PageParse.Empty ->
-                    // A previously active channel suddenly "empty" is a parse problem, not an empty channel.
-                    if (pagination || !(ch.baselineSet && ch.lastKnownMessageId > 0)) PageOutcome.Ok(p.title, emptyList())
-                    else PageOutcome.Failed(Failure(ChannelStatus.PARSE_FAILURE, "صفحة فارغة غير متوقعة لقناة فيها منشورات"))
-                PageParse.PreviewDisabled -> PageOutcome.Failed(
-                    Failure(ChannelStatus.PREVIEW_DISABLED, "المعاينة العامة موقفة؛ القراءة تتطلب تسجيل دخول")
-                )
-                PageParse.NotAChannel -> PageOutcome.Failed(
-                    Failure(ChannelStatus.NOT_FOUND, "القناة غير موجودة أو ليست قناة عامة")
-                )
-                is PageParse.Broken -> PageOutcome.Failed(Failure(ChannelStatus.PARSE_FAILURE, p.reason))
-            }
-        }
-    }
+    private fun SourcePage.Failed.toFailure() = Failure(channelStatus, message, rateLimited)
 
     companion object {
         const val MAX_PASSES = 3
-        const val SUSPECT_AFTER_SCANS = 2
+        const val SUSPECT_AFTER_SCANS = 3
         const val FAILURE_NOTIFY_THRESHOLD = 3
     }
 }

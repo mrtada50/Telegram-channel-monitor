@@ -6,6 +6,7 @@ import com.tgmonitor.app.data.ChannelStatus
 import com.tgmonitor.app.data.DeletionStatus
 import com.tgmonitor.app.engine.AddChannelResult
 import com.tgmonitor.app.engine.ChannelManager
+import com.tgmonitor.app.engine.HtmlMessageSource
 import com.tgmonitor.app.engine.NotificationKind
 import com.tgmonitor.app.engine.ScanEngine
 import com.tgmonitor.app.scraper.FetchResult
@@ -178,7 +179,7 @@ class ScanEngineTest {
         assertEquals("post 3", e.msg(3).currentText) // history retained
     }
 
-    @Test fun inconclusiveCheckGoesUnknownThenSuspected() = runTest {
+    @Test fun inconclusiveCheckGoesUnknownThenSuspectedAfterThreeScans() = runTest {
         val e = Env(); e.tg.addRange(1..5); e.tg.embedInconclusive = true
         val id = e.channel(); e.engine.scanChannel(id)
         e.tg.delete(3)
@@ -186,11 +187,88 @@ class ScanEngineTest {
         assertEquals(DeletionStatus.UNKNOWN, e.msg(3).deletionStatus)
         assertTrue(first.notifications.isEmpty())
         val second = e.engine.scanChannel(id)
-        assertEquals(DeletionStatus.SUSPECTED_DELETED, e.msg(3).deletionStatus)
-        assertEquals(NotificationKind.DELETION_SUSPECTED, second.notifications.single().kind)
-        assertTrue(e.store.events.none { it.changeType == ChangeType.DELETION_CONFIRMED })
+        assertEquals(DeletionStatus.UNKNOWN, e.msg(3).deletionStatus)
+        assertTrue(second.notifications.isEmpty())
         val third = e.engine.scanChannel(id)
-        assertTrue(third.notifications.isEmpty()) // no repeat alerts
+        assertEquals(DeletionStatus.SUSPECTED_DELETED, e.msg(3).deletionStatus)
+        assertEquals(NotificationKind.DELETION_SUSPECTED, third.notifications.single().kind)
+        assertTrue(e.store.events.none { it.changeType == ChangeType.DELETION_CONFIRMED })
+        assertTrue(e.engine.scanChannel(id).notifications.isEmpty()) // no repeat alerts
+    }
+
+    @Test fun staleCachedPageDoesNotCreateFalseEdit() = runTest {
+        val e = Env(); e.tg.addRange(1..5)
+        val id = e.channel(); e.engine.scanChannel(id)
+        val stale = e.tg.snapshot()                 // page with the old text
+        e.tg.editText(1, "edited text")
+        e.tg.scriptedPages += e.tg.snapshot()       // first look: edited
+        e.tg.scriptedPages += stale                 // confirmation look: old text again (disagrees)
+        val o = e.engine.scanChannel(id)
+        assertEquals(0, o.edits)
+        assertEquals("post 1", e.msg(1).currentText)
+        assertTrue(e.store.events.isEmpty())
+        // a real edit (both looks agree) is still recorded on the next scan
+        assertEquals(1, e.engine.scanChannel(id).edits)
+        assertEquals("edited text", e.msg(1).currentText)
+    }
+
+    @Test fun transientlyMissingPostIsNotADeletion() = runTest {
+        val e = Env(); e.tg.addRange(1..5)
+        val id = e.channel(); e.engine.scanChannel(id)
+        e.tg.hidden += 3
+        val partial = e.tg.snapshot()
+        e.tg.hidden -= 3
+        e.tg.scriptedPages += partial               // first look lacks post 3, confirmation look has it
+        val o = e.engine.scanChannel(id)
+        assertEquals(DeletionStatus.ACTIVE, e.msg(3).deletionStatus)
+        assertTrue(e.store.events.isEmpty())
+        assertTrue(o.notifications.isEmpty())
+        assertTrue(e.tg.requests.none { it.contains("embed=1") })
+    }
+
+    @Test fun newestPostsMissingFromAStalePageAreNotJudgedDeleted() = runTest {
+        val e = Env(); e.tg.addRange(1..5)
+        val id = e.channel(); e.engine.scanChannel(id)
+        e.tg.hidden += 5
+        val stale = e.tg.snapshot()                 // lacks the newest post only
+        e.tg.hidden -= 5
+        e.tg.scriptedPages += stale
+        e.engine.scanChannel(id)
+        assertEquals(DeletionStatus.ACTIVE, e.msg(5).deletionStatus)
+        assertTrue(e.store.events.isEmpty())
+        assertTrue(e.tg.requests.none { it.contains("embed=1") })
+    }
+
+    @Test fun olderPostsBelowTheCheckpointAreNeverReportedAsNew() = runTest {
+        val e = Env(); e.tg.pageSize = 5; e.tg.addRange(41..60)
+        val id = e.channel(); e.engine.scanChannel(id)      // baseline only saw 56..60
+        e.tg.pageSize = 20; e.tg.addRange(61..65)
+        val o = e.engine.scanChannel(id)                    // page now reaches back to 46
+        assertEquals(5, o.newPosts)
+        assertEquals((61L..65L).toList(), e.store.events.filter { it.changeType == ChangeType.NEW_POST }.map { it.messageId })
+        assertEquals(5, o.notifications.count { it.kind == NotificationKind.NEW_POST })
+        assertEquals(20, e.store.messages.size)             // 46..55 stored silently
+    }
+
+    @Test fun accountSourceIsUsedOnlyForChannelsThatAskForIt() = runTest {
+        val html = FakeTelegram("testchan"); html.previewDisabled = true
+        val account = FakeTelegram("testchan"); account.addRange(1..4)
+        val store = FakeStore()
+        var useAccount = false
+        val engine = ScanEngine(
+            store, html, clock = { 1L },
+            accountSource = HtmlMessageSource(account), useAccount = { useAccount },
+        )
+        val id = store.insertChannel(ChannelEntity(username = "testchan", title = "t", url = "u", dateAdded = 0))!!
+        val blocked = engine.scanChannel(id)
+        assertEquals(ChannelStatus.PREVIEW_DISABLED, blocked.channelStatus)
+        assertTrue(account.requests.isEmpty())
+
+        useAccount = true
+        val ok = engine.scanChannel(id)
+        assertTrue(ok.success)
+        assertEquals(4, store.messages.size)
+        assertEquals(ChannelStatus.OK, store.channels[0].status)
     }
 
     @Test fun postHiddenFromPreviewButStillExistingStaysActive() = runTest {

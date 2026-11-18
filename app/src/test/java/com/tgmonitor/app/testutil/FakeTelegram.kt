@@ -15,6 +15,8 @@ class FakeTelegram(private val username: String) : PageFetcher {
     var embedInconclusive = false
     var afterNextPageFetch: (() -> Unit)? = null
     var pageSize = 20
+    /** Responses served (in order) for the next newest-page requests, before normal behaviour resumes. */
+    val scriptedPages = ArrayDeque<FetchResult>()
     val requests = mutableListOf<String>()
 
     fun add(id: Long, text: String = "post $id", links: List<String> = emptyList(), hasText: Boolean = true) {
@@ -31,6 +33,7 @@ class FakeTelegram(private val username: String) : PageFetcher {
         requests += url
         if (url.contains("/s/")) {
             pageOverride?.let { return it }
+            scriptedPages.removeFirstOrNull()?.let { return it }
             if (previewDisabled) return FetchResult.Ok(Fixtures.load("preview_disabled.html"), "https://t.me/$username")
             if (notFound) return FetchResult.Ok(Fixtures.load("not_found.html"), "https://t.me/$username")
             val before = Regex("before=(\\d+)").find(url)?.groupValues?.get(1)?.toLongOrNull()
@@ -50,6 +53,10 @@ class FakeTelegram(private val username: String) : PageFetcher {
         }
         return FetchResult.HttpError(404)
     }
+
+    /** The newest page exactly as it looks right now (used to script stale / partial responses). */
+    fun snapshot(): FetchResult.Ok =
+        FetchResult.Ok(pageHtml(posts.keys.filter { it !in hidden }.takeLast(pageSize)), "https://t.me/s/$username")
 
     private fun pageHtml(ids: List<Long>): String {
         val sb = StringBuilder(

@@ -53,6 +53,7 @@ fun ChannelsScreen(vm: ChannelsViewModel, onOpen: (Long) -> Unit) {
     val channels by vm.channels.collectAsState()
     val adding by vm.adding.collectAsState()
     val message by vm.message.collectAsState()
+    val accountChannels by vm.accountChannels.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var toDelete by remember { mutableStateOf<ChannelEntity?>(null) }
 
@@ -93,6 +94,10 @@ fun ChannelsScreen(vm: ChannelsViewModel, onOpen: (Long) -> Unit) {
                     onToggle = { vm.setMonitoring(ch.id, it) },
                     onScan = { vm.scan(ch.id) },
                     onDelete = { toDelete = ch },
+                    accountAvailable = vm.accountAvailable,
+                    usesAccount = ch.id in accountChannels,
+                    onUseAccount = { vm.setUseAccount(ch.id, it) },
+                    onJoin = { vm.join(ch) },
                 )
             }
         }
@@ -125,6 +130,10 @@ private fun ChannelCard(
     onToggle: (Boolean) -> Unit,
     onScan: () -> Unit,
     onDelete: () -> Unit,
+    accountAvailable: Boolean,
+    usesAccount: Boolean,
+    onUseAccount: (Boolean) -> Unit,
+    onJoin: () -> Unit,
 ) {
     val color = statusColor(ch.status)
     val problem = ch.status != ChannelStatus.OK && ch.status != ChannelStatus.PENDING
@@ -146,6 +155,15 @@ private fun ChannelCard(
             "آخر فحص ناجح: ${TimeUtil.relative(ch.lastSuccessfulCheck)}",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (accountAvailable) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = usesAccount, onCheckedChange = onUseAccount)
+                Text("قراءة عبر حسابي", Modifier.weight(1f).padding(start = 8.dp), style = MaterialTheme.typography.bodySmall)
+                if (ch.status == ChannelStatus.PREVIEW_DISABLED || ch.status == ChannelStatus.ACCESS_DENIED) {
+                    TextButton(onClick = onJoin) { Text("انضمام") }
+                }
+            }
+        }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Switch(checked = ch.monitoringEnabled, onCheckedChange = onToggle)

@@ -10,6 +10,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Only when the user explicitly chose a JitPack-hosted TDLib build.
+        if (providers.gradleProperty("tdlibDep").orNull?.startsWith("com.github.") == true) {
+            maven("https://jitpack.io")
+        }
     }
 }
 rootProject.name = "TelegramChannelMonitor"

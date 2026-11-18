@@ -95,7 +95,10 @@ fun AppNav(container: AppContainer) {
                 )
             }
             composable("settings") {
-                SettingsScreen(viewModel<SettingsViewModel>(factory = VmFactory { SettingsViewModel(container) }))
+                SettingsScreen(
+                    viewModel<SettingsViewModel>(factory = VmFactory { SettingsViewModel(container) }),
+                    viewModel<AccountViewModel>(factory = VmFactory { AccountViewModel(container) }),
+                )
             }
             composable("channel/{id}", arguments = listOf(navArgument("id") { type = NavType.LongType })) { entry ->
                 val id = entry.arguments?.getLong("id") ?: 0L

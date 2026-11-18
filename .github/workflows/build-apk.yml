@@ -35,6 +35,27 @@ jobs:
           fi
           chmod +x gradlew
 
+      # Fixed signing key from repository secrets: updates install over the old app without uninstalling.
+      - name: Restore signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          K_ALIAS: ${{ secrets.KEY_ALIAS }}
+          K_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/app.keystore"
+            {
+              echo "KEYSTORE_FILE=$RUNNER_TEMP/app.keystore"
+              echo "KEYSTORE_PASSWORD=$KS_PASS"
+              echo "KEY_ALIAS=$K_ALIAS"
+              echo "KEY_PASSWORD=$K_PASS"
+            } >> "$GITHUB_ENV"
+            echo "Using the fixed signing key."
+          else
+            echo "No signing secrets found: falling back to the debug key (updates will need an uninstall)."
+          fi
+
       - name: Unit tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
@@ -47,6 +68,11 @@ jobs:
           test -n "$APK" || { echo "APK not found"; exit 1; }
           ls -l "$APK"
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Show signing certificate (must be identical in every build)
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)
+          "$APKSIGNER" verify --print-certs "$APK_PATH" | grep -i "SHA-256" || true
 
       - uses: actions/upload-artifact@v4
         with:

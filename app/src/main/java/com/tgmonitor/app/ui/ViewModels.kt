@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgmonitor.app.AppContainer
+import com.tgmonitor.app.account.AccountState
+import com.tgmonitor.app.account.JoinResult
 import com.tgmonitor.app.data.AppSettings
 import com.tgmonitor.app.data.ChangeListItem
 import com.tgmonitor.app.data.ChangeType
@@ -14,6 +16,8 @@ import com.tgmonitor.app.data.MessageListItem
 import com.tgmonitor.app.data.MessageVersionEntity
 import com.tgmonitor.app.engine.AddChannelResult
 import com.tgmonitor.app.engine.NotificationKind
+import com.tgmonitor.app.proxy.ProxyMode
+import com.tgmonitor.app.proxy.ProxyStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -93,6 +97,28 @@ class ChannelsViewModel(private val c: AppContainer) : ViewModel() {
         }
     }
 
+    val accountAvailable: Boolean = c.account.available
+    val accountChannels: StateFlow<Set<Long>> =
+        c.accountStore.accountChannelIds.stateIn(viewModelScope, WHILE_SUBSCRIBED, emptySet())
+
+    fun setUseAccount(id: Long, enabled: Boolean) {
+        c.appScope.launch {
+            c.accountStore.setChannelUsesAccount(id, enabled)
+            c.scheduler.scanNow(id, manual = true)
+        }
+    }
+
+    /** Joining is always a user action and rate-limited (one per 10 minutes) to protect the account. */
+    fun join(ch: ChannelEntity) {
+        c.appScope.launch {
+            message.value = when (val r = c.account.join(ch.username)) {
+                JoinResult.Joined -> "تم الانضمام للقناة. فعّل «قراءة عبر حسابي» لها ثم افحصها."
+                is JoinResult.Wait -> "انتظر ${r.minutes} دقيقة قبل الانضمام لقناة أخرى (لحماية حسابك)."
+                is JoinResult.Failed -> "تعذر الانضمام: ${r.message}"
+            }
+        }
+    }
+
     fun dismissMessage() { message.value = null }
     fun setMonitoring(id: Long, enabled: Boolean) { c.appScope.launch { c.channelManager.setMonitoring(id, enabled) } }
     fun remove(id: Long) { c.appScope.launch { c.channelManager.remove(id) } }
@@ -164,6 +190,11 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
         .stateIn(viewModelScope, WHILE_SUBSCRIBED, StorageStats())
     val exportMessage = MutableStateFlow<String?>(null)
 
+    val proxyStatus: StateFlow<ProxyStatus> = c.proxy.status
+    fun setProxyMode(mode: ProxyMode) { c.appScope.launch { c.proxy.setMode(mode) } }
+    fun searchProxy() { c.appScope.launch { c.proxy.searchNow() } }
+    fun stopProxy() { c.appScope.launch { c.proxy.clear("عُدت للاتصال المباشر") } }
+
     fun setInterval(minutes: Int) {
         c.appScope.launch {
             c.settings.setInterval(minutes)
@@ -192,4 +223,30 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
             }
         }
     }
+}
+
+class AccountViewModel(private val c: AppContainer) : ViewModel() {
+    val available: Boolean = c.account.available
+    val state: StateFlow<AccountState> = c.account.state
+    val error: StateFlow<String?> = c.account.lastError
+
+    init {
+        // Starts the TDLib client (if credentials exist) so the real login state shows up.
+        if (available) c.appScope.launch { c.account.awaitReady(15_000L) }
+    }
+
+    /** Returns an error message, or null when accepted. */
+    fun saveCredentials(apiIdText: String, apiHash: String): String? {
+        val id = apiIdText.trim().toIntOrNull()
+        if (id == null || id <= 0) return "api_id يجب أن يكون رقماً صحيحاً"
+        val hash = apiHash.trim()
+        if (!Regex("^[0-9a-fA-F]{32}$").matches(hash)) return "api_hash يجب أن يكون 32 خانة (حروف وأرقام)"
+        c.appScope.launch { c.account.configure(id, hash) }
+        return null
+    }
+
+    fun submitPhone(phone: String) = c.account.submitPhone(phone)
+    fun submitCode(code: String) = c.account.submitCode(code)
+    fun submitPassword(password: String) = c.account.submitPassword(password)
+    fun logout() = c.account.logout()
 }

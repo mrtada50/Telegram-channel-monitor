@@ -33,7 +33,7 @@ import com.tgmonitor.app.engine.IntervalPolicy
 import com.tgmonitor.app.engine.NotificationKind
 
 @Composable
-fun SettingsScreen(vm: SettingsViewModel) {
+fun SettingsScreen(vm: SettingsViewModel, accountVm: AccountViewModel) {
     val settings by vm.settings.collectAsState()
     val stats by vm.stats.collectAsState()
     val exportMessage by vm.exportMessage.collectAsState()
@@ -94,6 +94,12 @@ fun SettingsScreen(vm: SettingsViewModel) {
                 }) { Text("إعدادات استثناء البطارية") }
             }
         }
+
+        item(key = "net-t") { SectionTitle("الاتصال والحجب") }
+        item(key = "net") { ProxyCard(vm) }
+
+        item(key = "acc-t") { SectionTitle("حساب تيليجرام") }
+        item(key = "acc") { AccountCard(accountVm) }
 
         item(key = "not-t") { SectionTitle("الإشعارات") }
         item(key = "not") {
