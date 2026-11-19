@@ -25,6 +25,7 @@ data class ProxyEndpoint(val type: ProxyType, val host: String, val port: Int) {
 data class ProxyStatus(
     val mode: ProxyMode = ProxyMode.AUTO,
     val current: String? = null,
+    val poolSize: Int = 0,
     val searching: Boolean = false,
     val message: String? = null,
 )
@@ -38,9 +39,13 @@ interface ProxyBackend {
     /** Control probe: can we reach a neutral host directly? (separates "no internet" from "Telegram blocked"). */
     suspend fun internetReachable(): Boolean
 
-    /** Search public lists, validate candidates against real Telegram pages, remember the winner. */
+    /** Search public lists, validate candidates against real Telegram pages, remember the winners (a pool). */
     suspend fun findWorking(): ProxyEndpoint?
     suspend fun invalidate(proxy: ProxyEndpoint)
+
+    /** A block was confirmed recently: skip the slow direct attempt and go straight to the proxy pool. */
+    suspend fun knownBlocked(): Boolean
+    suspend fun markBlocked()
 }
 
 object ProxyListParser {
@@ -95,8 +100,8 @@ object BlockHeuristics {
 }
 
 /**
- * Direct first; if Telegram looks blocked (and the internet itself works), find a proxy that really
- * serves Telegram pages and retry through it. A dead proxy is forgotten and the next call re-checks.
+ * Pooled proxies first (rotating instantly when one is dead), then direct unless a block was confirmed
+ * recently, then a fresh proxy search. A dead proxy never costs a long direct timeout.
  */
 class ProxyAwareFetcher(
     private val direct: PageFetcher,
@@ -106,19 +111,32 @@ class ProxyAwareFetcher(
     override suspend fun fetch(url: String): FetchResult {
         if (backend.mode() == ProxyMode.OFF) return direct.fetch(url)
 
-        val active = backend.current()
-        if (active != null) {
+        // 1) Pooled proxies.
+        var tries = 0
+        while (tries < MAX_POOL_TRIES) {
+            val active = backend.current() ?: break
+            tries++
             val r = backend.fetchVia(active, url)
             if (!BlockHeuristics.proxyFailed(r)) return r
-            backend.invalidate(active) // dead proxy: forget it, fall back to a direct attempt
+            backend.invalidate(active)
         }
 
-        val first = direct.fetch(url)
+        // 2) Direct, unless the block was confirmed recently.
+        val knownBlocked = backend.knownBlocked()
+        val first: FetchResult =
+            if (knownBlocked) FetchResult.NetworkError("تيليجرام محجوب ولا يوجد بروكسي جاهز")
+            else direct.fetch(url)
         if (!BlockHeuristics.looksBlocked(first)) return first
-        if (!backend.internetReachable()) return first // offline, not blocked: nothing to do
+        if (!knownBlocked && !backend.internetReachable()) return first // offline, not blocked
+        backend.markBlocked()
 
+        // 3) A fresh proxy search, then retry through the winner.
         val found = backend.findWorking() ?: return first
         val viaProxy = backend.fetchVia(found, url)
         return if (BlockHeuristics.proxyFailed(viaProxy)) first else viaProxy
+    }
+
+    private companion object {
+        const val MAX_POOL_TRIES = 3
     }
 }

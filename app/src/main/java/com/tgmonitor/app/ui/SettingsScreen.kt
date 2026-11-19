@@ -95,6 +95,9 @@ fun SettingsScreen(vm: SettingsViewModel, accountVm: AccountViewModel) {
             }
         }
 
+        item(key = "bg-t") { SectionTitle("حالة الفحص بالخلفية") }
+        item(key = "bg") { BackgroundHealthCard() }
+
         item(key = "net-t") { SectionTitle("الاتصال والحجب") }
         item(key = "net") { ProxyCard(vm) }
 

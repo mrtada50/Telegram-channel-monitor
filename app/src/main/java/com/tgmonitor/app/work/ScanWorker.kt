@@ -24,8 +24,23 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         val channels = if (single > 0) listOfNotNull(container.store.getChannel(single))
         else container.store.getEnabledChannelsStalestFirst()
 
+        val label = if (manual) "يدوي" else "مجدول"
+        val proxy = container.proxy
+        proxy.log("بدأ فحص $label (${channels.size} قناة)")
+        // Make sure a proxy pool is ready BEFORE the first channel, so a slow search never happens mid-channel.
+        try {
+            proxy.prepare()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            proxy.log("خطأ أثناء تجهيز الاتصال: ${e.message}")
+        }
+
         val notifications = mutableListOf<ScanNotification>()
         var rateLimited = false
+        var succeeded = 0
+        var failed = 0
+        var firstError: String? = null
         for ((index, channel) in channels.withIndex()) {
             if (isStopped) break
             if (index > 0) delay(Random.nextLong(MIN_GAP_MS, MAX_GAP_MS + 1))
@@ -37,11 +52,16 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                 ScanOutcome(status = "FAILED", error = e.message)
             }
             notifications += outcome.notifications
+            if (outcome.success) succeeded++ else {
+                failed++
+                if (firstError == null) firstError = outcome.error
+            }
             if (outcome.rateLimited) {
                 rateLimited = true
                 break
             }
         }
+        proxy.log("انتهى فحص $label: نجح $succeeded، فشل $failed" + (firstError?.let { " — $it" } ?: ""))
         container.notifier.notify(notifications, settings)
         return if (rateLimited) Result.retry() else Result.success()
     }

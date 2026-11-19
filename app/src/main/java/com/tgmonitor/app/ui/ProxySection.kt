@@ -24,6 +24,7 @@ import com.tgmonitor.app.ui.theme.Semantic
 @Composable
 fun ProxyCard(vm: SettingsViewModel) {
     val st by vm.proxyStatus.collectAsState()
+    val log by vm.connectionLog.collectAsState()
     AppCard {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("إذا كان تيليجرام محجوباً", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
@@ -43,6 +44,7 @@ fun ProxyCard(vm: SettingsViewModel) {
             FilterChip(selected = st.mode == ProxyMode.OFF, onClick = { vm.setProxyMode(ProxyMode.OFF) }, label = { Text("إيقاف البروكسي") })
         }
         st.current?.let { InfoLine("البروكسي الحالي", it) }
+        if (st.poolSize > 0) InfoLine("بروكسيات جاهزة", st.poolSize.toString())
         st.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = { vm.searchProxy() }, enabled = !st.searching && st.mode == ProxyMode.AUTO) {
@@ -53,6 +55,10 @@ fun ProxyCard(vm: SettingsViewModel) {
                 Text(if (st.searching) "جارٍ البحث..." else "ابحث عن بروكسي الآن")
             }
             if (st.current != null) OutlinedButton(onClick = { vm.stopProxy() }) { Text("اتصال مباشر") }
+        }
+        if (log.isNotEmpty()) {
+            Text("سجل الاتصال (الأحدث أولاً)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            log.take(10).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
         Text(
             "ملاحظة: البروكسيات العامة غير موثوقة. لا تُرسل عبرها كلمات مرور، والاتصال بتيليجرام مشفّر (HTTPS) فلا يستطيع البروكسي قراءة المحتوى أو تزويره، " +

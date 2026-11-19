@@ -91,13 +91,22 @@ class ProxyAwareFetcherTest {
         var via: FetchResult = FetchResult.Ok("<div class=\"tgme_widget_message\">x</div>", "https://t.me/s/x")
         var searches = 0
         var viaCalls = 0
+        var blocked = false
+        var marked = 0
+        var pool = mutableListOf<ProxyEndpoint>()
         val invalidated = mutableListOf<ProxyEndpoint>()
         override suspend fun mode() = mode
-        override suspend fun current() = current
+        override suspend fun current(): ProxyEndpoint? = pool.firstOrNull() ?: current
         override suspend fun fetchVia(proxy: ProxyEndpoint, url: String): FetchResult { viaCalls++; return via }
         override suspend fun internetReachable() = reachable
         override suspend fun findWorking(): ProxyEndpoint? { searches++; return found }
-        override suspend fun invalidate(proxy: ProxyEndpoint) { invalidated += proxy; if (current == proxy) current = null }
+        override suspend fun invalidate(proxy: ProxyEndpoint) {
+            invalidated += proxy
+            pool.remove(proxy)
+            if (current == proxy) current = null
+        }
+        override suspend fun knownBlocked() = blocked
+        override suspend fun markBlocked() { marked++; blocked = true }
     }
 
     @Test fun offModeNeverTouchesProxies() = runTest {
@@ -165,5 +174,37 @@ class ProxyAwareFetcherTest {
         val err = FetchResult.NetworkError("timeout")
         val d = Direct(err); val b = Backend().apply { found = proxy; via = FetchResult.NetworkError("proxy dead") }
         assertSame(err, ProxyAwareFetcher(d, b).fetch("u"))
+    }
+
+    @Test fun knownBlockSkipsTheSlowDirectAttemptAndSearchesImmediately() = runTest {
+        val d = Direct(FetchResult.NetworkError("would waste 15s")); val b = Backend().apply { blocked = true; found = proxy }
+        val r = ProxyAwareFetcher(d, b).fetch("u")
+        assertSame(b.via, r)
+        assertEquals(0, d.calls)
+        assertEquals(1, b.searches)
+    }
+
+    @Test fun deadProxyRotatesToTheNextOneWithoutTouchingDirect() = runTest {
+        val second = ProxyEndpoint(ProxyType.SOCKS5, "5.6.7.8", 1080)
+        val d = Direct(FetchResult.NetworkError("blocked"))
+        val b = Backend().apply { pool = mutableListOf(proxy, second) }
+        var n = 0
+        // first proxy dead, second proxy good
+        val dead = FetchResult.NetworkError("dead")
+        val good = b.via
+        val fetcher = object : ProxyBackend by b {
+            override suspend fun fetchVia(proxy: ProxyEndpoint, url: String): FetchResult { n++; return if (n == 1) dead else good }
+        }
+        val r = ProxyAwareFetcher(d, fetcher).fetch("u")
+        assertSame(good, r)
+        assertEquals(0, d.calls)
+        assertEquals(listOf(proxy), b.invalidated)
+    }
+
+    @Test fun confirmedBlockIsRemembered() = runTest {
+        val d = Direct(FetchResult.NetworkError("timeout")); val b = Backend().apply { found = proxy }
+        ProxyAwareFetcher(d, b).fetch("u")
+        assertEquals(1, b.marked)
+        assertTrue(b.blocked)
     }
 }

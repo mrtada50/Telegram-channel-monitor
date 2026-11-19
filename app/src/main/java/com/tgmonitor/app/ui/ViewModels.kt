@@ -191,6 +191,7 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
     val exportMessage = MutableStateFlow<String?>(null)
 
     val proxyStatus: StateFlow<ProxyStatus> = c.proxy.status
+    val connectionLog: StateFlow<List<String>> = c.proxy.logs.stateIn(viewModelScope, WHILE_SUBSCRIBED, emptyList())
     fun setProxyMode(mode: ProxyMode) { c.appScope.launch { c.proxy.setMode(mode) } }
     fun searchProxy() { c.appScope.launch { c.proxy.searchNow() } }
     fun stopProxy() { c.appScope.launch { c.proxy.clear("عُدت للاتصال المباشر") } }

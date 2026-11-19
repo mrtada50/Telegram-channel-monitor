@@ -18,8 +18,8 @@ android {
         applicationId = "com.tgmonitor.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.2.0"
+        versionCode = 5
+        versionName = "1.2.1"
     }
 
     // A FIXED signing key (from CI secrets) lets every new build install over the old one with no uninstall.
