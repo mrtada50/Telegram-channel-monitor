@@ -53,7 +53,8 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "Using the fixed signing key."
           else
-            echo "No signing secrets found: falling back to the debug key (updates will need an uninstall)."
+            echo "::error::Signing secrets are missing (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD). Stopping so the app is never signed with a random key."
+            exit 1
           fi
 
       - name: Unit tests
